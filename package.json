@@ -1,0 +1,9 @@
+{
+  "name": "warranty-lookup",
+  "version": "1.0.0",
+  "description": "保固結束日期查詢API，給C.ai接API功能使用",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.19.2" }
+}
