@@ -1,11 +1,5 @@
 /**
- * 丈量預約單 - 選材網站
- * 客戶瀏覽衛浴商品 -> 選材(可複選) -> 填寫聯絡資料 -> 一次送出
- * 寫入 BizForm「丈量預約單範本」表單（form.id=16）
- *
- * 注意：這張表單屬於不同的站台（depotId=d6dec2f63f1c47ec8e10af11e808a559），
- * 跟花藝/壽衣不是同一組，請確認您的 x-api-key 是否對這個站台有效，
- * 若無效需要另外申請這個站台專用的 API Key。
+ * 丈量預約單 - 選材網站 & 一次性保固查詢 API (支援多筆明細)
  */
 
 const express = require('express');
@@ -15,9 +9,9 @@ app.use(express.static(__dirname));
 
 const BIZFORM_BASE = 'https://bizform.vitalyun.com/backend/api';
 const API_KEY = process.env.BIZFORM_API_KEY;
-const FORM_ID = 16;
 
-// 各欄位真正的 id（field_N，來自表單 GET 回傳的 attributes）
+// === 1. 丈量預約單設定 ===
+const FORM_ID = 16;
 const FIELD_IDS = {
   address: 'field_5',    // 丈量地址
   custName: 'field_7',   // 客戶姓名
@@ -31,6 +25,21 @@ const FIELD_IDS = {
   email: 'field_36',     // 電子郵件
 };
 
+// === 2. 驗收單(保固查詢)設定 ===
+const ACCEPTANCE_FORM_ID = 19; 
+const ACCEPTANCE_PHONE_FIELD_NAME = 'c113f953d306439fa6da7a782566d8f7'; // 聯絡電話
+
+// 我從你的 json 幫你找出來的明細表真實 ID
+const ACCEPTANCE_GRID_FIELD_ID = 'field_41'; 
+
+// 明細表由左至右的欄位索引 (Index)
+// 0: 項次(field_42) | 1: 驗收項目(field_43) | 2: 驗收結果(field_44) | 3: 保固日期(field_45)
+const COL_INDEX_ITEM_NAME = 1; 
+const COL_INDEX_WARRANTY_DATE = 3; 
+
+// =========================================================
+// API 1: 寫入丈量預約單 (你原本寫的功能，完整保留)
+// =========================================================
 app.post('/api/submit', async (req, res) => {
   try {
     const { name, phone, email, address, date, timeslot, space, need, note, materialCodes } = req.body;
@@ -98,30 +107,24 @@ app.post('/api/submit', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
-
-/**
- * 給 C.ai 用的查詢端點：依客戶電話查詢「驗收單範本」的保固結束日期
- * 用法：GET /api/warranty-end-date?phone=0912345678
- */
-const ACCEPTANCE_FORM_ID = 19; // 驗收單範本 form.id
-const ACCEPTANCE_PHONE_FIELD_NAME = 'c113f953d306439fa6da7a782566d8f7'; // 聯絡電話欄位的 name(內部識別碼)
-const ACCEPTANCE_WARRANTY_END_FIELD_ID = 'field_40'; // 保固結束日期
-
+// =========================================================
+// API 2: 依電話查詢最新驗收單，回傳格式化保固字串 (支援多個項目)
+// 用法：GET /api/warranty-end-date?phone=0901181123
+// =========================================================
 app.get('/api/warranty-end-date', async (req, res) => {
   try {
     const phone = req.query.phone;
     if (!phone) return res.status(400).json({ error: '請提供 phone 參數' });
 
+    // 1. 查詢最新一筆該電話的驗收單
     const queryBody = {
       formId: ACCEPTANCE_FORM_ID,
       attributes: [{ key: ACCEPTANCE_PHONE_FIELD_NAME, value: phone }],
       pageIndex: 1,
-      pageSize: 10,
+      pageSize: 1, // 抓最新一筆
       includeAttributes: true,
-      sorting: 0, // 依修改時間排序
-      desc: true, // 由新到舊，抓最新的一筆
+      sorting: 0,
+      desc: true,
     };
 
     const bizRes = await fetch(`${BIZFORM_BASE}/Documents/query`, {
@@ -134,29 +137,59 @@ app.get('/api/warranty-end-date', async (req, res) => {
       body: JSON.stringify(queryBody),
     });
 
-    if (!bizRes.ok) {
-      const text = await bizRes.text();
-      console.error('查詢驗收單失敗:', bizRes.status, text);
-      return res.status(502).json({ error: '查詢失敗，請稍後再試' });
-    }
+    if (!bizRes.ok) return res.status(502).json({ error: '查詢失敗' });
 
     const docs = await bizRes.json();
     if (!Array.isArray(docs) || docs.length === 0) {
-      return res.status(404).json({ error: '找不到符合這個電話的驗收單資料' });
+      return res.status(404).json({ error: '找不到該電話的保固資料' });
     }
 
-    // 取最新一筆
-    const doc = docs[0];
-    const attr = (doc.attributes || []).find(a => a.id === ACCEPTANCE_WARRANTY_END_FIELD_ID);
-    const warrantyEndDate = attr && attr.value && attr.value[0] ? attr.value[0] : null;
+    const latestDoc = docs[0];
 
+    // 2. 抓取 field_41 明細表資料
+    const gridAttr = (latestDoc.attributes || []).find(a => a.id === ACCEPTANCE_GRID_FIELD_ID);
+    
+    let warrantyText = "查無保固明細";
+
+    // 3. 解析明細表並組裝字串
+    if (gridAttr && gridAttr.value && gridAttr.value.length > 0) {
+      try {
+        // 解析 BizForm 傳回來的 2D 陣列
+        const rows = typeof gridAttr.value[0] === 'string' ? JSON.parse(gridAttr.value[0]) : gridAttr.value[0];
+        
+        let itemsList = [];
+        for (let row of rows) {
+          if (!row || row.length === 0) continue; 
+          
+          const itemName = row[COL_INDEX_ITEM_NAME];
+          const date = row[COL_INDEX_WARRANTY_DATE];
+          
+          // 只要名稱跟日期有值，就組合成一句話
+          if (itemName && date) {
+            itemsList.push(`${itemName}的保固到期日: ${date}`);
+          }
+        }
+        
+        // 如果有抓到資料，就加上中括號
+        if (itemsList.length > 0) {
+          warrantyText = `[${itemsList.join('， ')}]`;
+        }
+      } catch (e) {
+        console.error("解析明細表失敗:", e);
+        warrantyText = "解析保固資料發生錯誤";
+      }
+    }
+
+    // 4. 回傳給 C.ai
     res.json({
       phone,
-      documentId: doc.id,
-      warrantyEndDate,
+      documentId: latestDoc.id,
+      warrantyText: warrantyText
     });
   } catch (err) {
-    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server listening on :${PORT}`));
